@@ -413,6 +413,12 @@ static void irw_ensure(size_t need_bytes) {
 static uint16_t loadw_checksum(uint8_t *pix, int stride, int w, int h, uint16_t *out_max) {
     uint16_t sum = 0, max_val = 0;
     int n_words = (stride * h) / 2;
+    /* FUN_1854_35fc's loop pre-decrements the 32-bit word count and breaks
+     * when it reaches 0, so it reads count-1 words: the final word is NOT
+     * included in the sum/max. This is observable in UMK3 (SBZAP14E vs
+     * SBZAP14F collide on the full 6-word sum but not on the 5-word sum,
+     * and the reference encodes 14F instead of deduping it). */
+    if (n_words > 0) n_words--;
     uint16_t *wp = (uint16_t*)pix;
     for (int i = 0; i < n_words; i++) {
         uint16_t v = wp[i];
@@ -441,23 +447,49 @@ typedef struct {
 static DedupEntry dedup_table[MAX_DEDUP];
 static int n_dedup = 0;
 
-static void irw_write_bits(uint32_t val, int nbits) {
-    uint32_t bit_pos = g.irw_bit;
-    size_t need = (bit_pos + nbits + 7) / 8 + 1;
+/* LOADW FUN_1000_7af7 — the bit accumulator.
+ *
+ * Bits are ORed into a 16-bit register (acc) at the current bit offset (bc).
+ * Whenever bc exceeds 15 the whole 16-bit register is written out as a
+ * little-endian 16-bit word, bc is reduced by 16, and the bits of the value
+ * that did not fit are carried into the next register. Because the value is
+ * shifted into a 16-bit register, a value wider than `nbits` leaks its high
+ * bits into the following fields — this is observable in UMK3 when PPP> forces
+ * bpp=6 yet a sprite contains out-of-range pixels (0xFF). */
+static uint16_t irw_acc = 0;
+static int      irw_bc = 0;        /* pending bit count, 0..15 */
+static uint32_t irw_word = 0;      /* byte offset of the next 16-bit output word */
+
+static void irw_flush_word(void) {
+    size_t need = irw_word + 2;
     if (need > g.irw_size) {
         irw_ensure(need - g.irw_size + 16);
         g.irw_size = need;
     }
-    for (int i = 0; i < nbits; i++) {
-        uint32_t b = bit_pos / 8;
-        uint32_t bi = bit_pos % 8;
-        if (val & (1u << i))
-            g.irw_data[b] |= (uint8_t)(1u << bi);
+    g.irw_data[irw_word]     = (uint8_t)(irw_acc & 0xff);
+    g.irw_data[irw_word + 1] = (uint8_t)((irw_acc >> 8) & 0xff);
+    irw_word += 2;
+}
+
+static void irw_write_bits(uint32_t val, int nbits) {
+    irw_acc = (uint16_t)(irw_acc | (uint16_t)((val << (irw_bc & 0x1f)) & 0xffff));
+    irw_bc += nbits;
+    if (irw_bc > 15) {
+        irw_flush_word();
+        irw_bc -= 16;
+        if (irw_bc == 0)
+            val = 0;
         else
-            g.irw_data[b] &= (uint8_t)~(1u << bi);
-        bit_pos++;
+            val = (val >> ((nbits - irw_bc) & 0x1f)) & 0xffff;
+        irw_acc = (uint16_t)val;
     }
-    g.irw_bit = bit_pos;
+    g.irw_bit = irw_word * 8u + (uint32_t)irw_bc;
+}
+
+/* Flush the final partial word so the pending bits land in g.irw_data. */
+static void irw_finalize(void) {
+    if (irw_bc > 0)
+        irw_flush_word();
 }
 
 static void irw_write_byte(uint8_t val) {
@@ -1238,7 +1270,11 @@ static uint32_t encode_image(ImgFile *img, IMG_REC *rec, CompParams *cp, int bpp
         if (g.zon && do_cmp) {
             encode_row(row, scl_stride, scl_stride, bpp, cp->lm_mult, cp->tm_mult, &running_lead);
         } else {
-            int zw = g.old_mode ? IMG_STRIDE(rec->w) : (g.pad4bits ? OUT_STRIDE(rec->w) : rec->w);
+            /* LOADW clamps the image width to a minimum of 3 (FUN_1000_550a:
+             * "if (w < 3) w = 3;"), so CMP=0 output width is always
+             * OUT_STRIDE(rec->w) — not raw rec->w. Without /P modern mode this
+             * is max(w,3); with /P it is 4-byte aligned. */
+            int zw = g.old_mode ? IMG_STRIDE(rec->w) : OUT_STRIDE(rec->w);
             if (g.xon && (!g.zon || !do_cmp)) zw = OUT_STRIDE(rec->w + 1);
             if (zw < 1) zw = 1;
             for (int x = 0; x < zw; x++)
@@ -1581,8 +1617,18 @@ static void parse_ihdr(const char *line) {
 static void parse_addr(const char *line) {
     unsigned long addr = 0, end = 0;
     int bank = 0;
-    sscanf(line + 4, "%lx,%lx,%d", &addr, &end, &bank);
-    if (addr == 0) sscanf(line + 4, "%lx", &addr);
+    /* LOD syntax is `***> addr[,bank]` (the second field is the bank number,
+     * written to IRW header offset 0x3C). */
+    {
+        const char *p = line + 4;
+        while (*p == ' ' || *p == '\t') p++;
+        char *endp = NULL;
+        addr = strtoul(p, &endp, 16);
+        while (endp && (*endp == ' ' || *endp == '\t')) endp++;
+        if (endp && *endp == ',') {
+            bank = (int)strtol(endp + 1, NULL, 10);
+        }
+    }
     fprintf(stderr, "PARSE_ADDR: line=[%s] addr=0x%lx end=0x%lx bank=%d\n", line+4, addr, end, bank);
     g.base_addr = (uint32_t)addr;
     g.end_addr = (uint32_t)end;
@@ -2416,15 +2462,28 @@ static void process_lod(const char *lod_path) {
             char bdb_path[MAX_PATH], bdd_path[MAX_PATH];
             FILE *bdb_f = NULL, *bdd_f = NULL;
             const char *dirs[] = { g.imgdir, "." };
+            char base_up[64], base_lo[64];
+            {
+                int i;
+                for (i = 0; base[i] && i < 63; i++) base_up[i] = (char)toupper((unsigned char)base[i]);
+                base_up[i] = 0;
+                for (i = 0; base[i] && i < 63; i++) base_lo[i] = (char)tolower((unsigned char)base[i]);
+                base_lo[i] = 0;
+            }
+            const char *cases[] = { base, base_up, base_lo, NULL };
             for (int di = 0; di < 2 && !bdb_f; di++) {
                 if (!dirs[di][0]) continue;
-                snprintf(bdb_path, MAX_PATH, "%s%c%s.BDB", dirs[di], PATH_SEP, base);
-                bdb_f = fopen(bdb_path, "rb");
+                for (int ci = 0; cases[ci] && !bdb_f; ci++) {
+                    snprintf(bdb_path, MAX_PATH, "%s%c%s.BDB", dirs[di], PATH_SEP, cases[ci]);
+                    bdb_f = fopen(bdb_path, "rb");
+                }
             }
             for (int di = 0; di < 2 && !bdd_f; di++) {
                 if (!dirs[di][0]) continue;
-                snprintf(bdd_path, MAX_PATH, "%s%c%s.BDD", dirs[di], PATH_SEP, base);
-                bdd_f = fopen(bdd_path, "rb");
+                for (int ci = 0; cases[ci] && !bdd_f; ci++) {
+                    snprintf(bdd_path, MAX_PATH, "%s%c%s.BDD", dirs[di], PATH_SEP, cases[ci]);
+                    bdd_f = fopen(bdd_path, "rb");
+                }
             }
             if (!bdb_f) { fprintf(stderr, "WARNING: cannot open %s.BDB\n", base); continue; }
             if (!bdd_f) { fclose(bdb_f); fprintf(stderr, "WARNING: cannot open %s.BDD\n", base); continue; }
@@ -3117,7 +3176,10 @@ static void write_irw(const char *path) {
     memset(hdr, 0, sizeof(hdr));
     strncpy((char*)hdr, IRW_DATE_STR, 8);
 
-    uint32_t data_bytes = (g.irw_bit + 7) / 8;
+    /* LOADW emits the bit stream as whole 16-bit words, so the data section is
+     * padded up to a 16-bit boundary (irw_word already counts the flushed
+     * words, including the final partial one). */
+    uint32_t data_bytes = irw_word ? irw_word : (uint32_t)((g.irw_bit + 7) / 8);
     /* magic constants at 0x20-0x23 */
     hdr[0x20] = 0x94; hdr[0x21] = 0x01;  /* 0x0194 */
     hdr[0x22] = 0x64; hdr[0x23] = 0x00;  /* 0x0064 */
@@ -3150,9 +3212,12 @@ static void write_irw(const char *path) {
     }
     /* always 4 at 0x38 */
     hdr[0x38] = 0x04;
-    /* flags at 0x3C (0xFFFF for /OLD, 0 otherwise) */
+    /* flags at 0x3C: 0xFFFF for /OLD, otherwise the ***> bank number */
     if (g.old_mode) {
         hdr[0x3C] = 0xFF; hdr[0x3D] = 0xFF;
+    } else {
+        hdr[0x3C] = (uint8_t)(g.bank & 0xff);
+        hdr[0x3D] = (uint8_t)((g.bank >> 8) & 0xff);
     }
 
     FILE *f = fopen(path, "wb");
@@ -3364,12 +3429,16 @@ int main(int argc, char *argv[]) {
     g.irw_data = (uint8_t*)calloc(1, g.irw_alloc);
     g.irw_size = 0;
     g.irw_bit = 0;
+    irw_acc = 0;
+    irw_bc = 0;
+    irw_word = 0;
     g.sagpal_combined = 1; /* default: combined SAG+PAL (NARC style); POF> sets to 0 */
 
     scan_bpp(lod_file);
     scan_for_bbb(lod_file);
     process_lod(lod_file);
 
+    irw_finalize();
     if (g.build_raw) write_irw(irw_path);
 
     /* Generate IMGTBL.ASM wrapper (includes all GLO files) */
